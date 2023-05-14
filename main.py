@@ -9,6 +9,7 @@ from optparse import OptionParser
 from os import mkdir
 from os.path import exists
 from time import sleep
+from os import environ
 
 from multiprocess import Pool, Lock, Manager
 
@@ -74,7 +75,7 @@ def split_book(chapters,outBaseDir,stdoutlock):
         stdoutlock.release()
             
         command = ["ffmpeg", 
-                    "-activation_bytes", "cbdab406",
+                    "-activation_bytes", environ["audible.activation_bytes"],
                     "-vn", 
                     "-vsync", "2",
                     "-i", c["orgFile"],
