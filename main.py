@@ -77,6 +77,12 @@ def chapter_filename(chapter: dict, chapter_width: int, cd_width: int, out_forma
     return f"{chapter['cd']:0{cd_width}d}-{chapter['chp']:0{chapter_width}d}-{chapter['bname']}.{out_format}"
 
 
+def compute_padding(chapters: list[dict]) -> tuple[int, int]:
+    chapter_width = max(3, len(str(len(chapters))))
+    cd_width = max(2, len(str(max(c["cd"] for c in chapters))))
+    return chapter_width, cd_width
+
+
 def convert_chapter(
     ffmpeg_path: str,
     chapter: dict,
@@ -124,8 +130,7 @@ def process_book(
     progress: Progress,
     books_task: TaskID,
 ) -> tuple[str, list[tuple[str, str]]]:
-    chapter_width = max(3, len(str(len(chapters))))
-    cd_width = max(2, len(str(max(c["cd"] for c in chapters))))
+    chapter_width, cd_width = compute_padding(chapters)
     out_dir = output_dir / chapters[0]["bname"]
 
     book_task = progress.add_task(f"[cyan]{book_name}", total=len(chapters))
@@ -155,6 +160,36 @@ def process_book(
 
 def discover_books(input_dir: Path) -> list[Path]:
     return sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() == ".aax")
+
+
+def print_dry_run_report(books: dict[str, list[dict]], output_dir: Path, out_format: str) -> None:
+    console.print("[bold]Dry run[/bold] — no files will be converted.\n")
+
+    total_chapters = 0
+    total_existing = 0
+    for book_name, chapters in books.items():
+        chapter_width, cd_width = compute_padding(chapters)
+        out_dir = output_dir / chapters[0]["bname"]
+
+        existing = 0
+        console.print(f"[cyan]{book_name}[/cyan] ({len(chapters)} chapters -> {out_dir})")
+        for chapter in chapters:
+            out_name = chapter_filename(chapter, chapter_width, cd_width, out_format)
+            already_exists = (out_dir / out_name).exists()
+            if already_exists:
+                existing += 1
+                console.print(f"  {out_name}  [yellow](exists)[/yellow]")
+            else:
+                console.print(f"  {out_name}  [green](will create)[/green]")
+
+        console.print(f"  -> {existing} already exist, {len(chapters) - existing} to create\n")
+        total_chapters += len(chapters)
+        total_existing += existing
+
+    console.print(
+        f"[bold]Summary:[/bold] {len(books)} book(s), {total_chapters} chapter(s) total — "
+        f"{total_existing} already exist, {total_chapters - total_existing} would be created."
+    )
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -192,6 +227,10 @@ def discover_books(input_dir: Path) -> list[Path]:
     "--ffmpeg", "ffmpeg_override", default=None,
     help="Explicit path to an ffmpeg executable (overrides PATH lookup).",
 )
+@click.option(
+    "--dry-run", "dry_run", is_flag=True, default=False,
+    help="List what would be converted, and which output files already exist, without converting anything.",
+)
 def main(
     input_dir: Path,
     output_dir: Path,
@@ -200,6 +239,7 @@ def main(
     book_workers: int,
     chapter_workers: int,
     ffmpeg_override: str | None,
+    dry_run: bool,
 ) -> None:
     """Convert Audible AAX audiobooks into per-chapter audio files."""
     try:
@@ -208,7 +248,7 @@ def main(
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
 
-    if not activation_bytes:
+    if not dry_run and not activation_bytes:
         console.print(
             "[red]No Audible activation bytes provided. "
             "Pass --activation-bytes or set the AUDIBLE_ACTIVATION_BYTES environment variable.[/red]"
@@ -240,6 +280,12 @@ def main(
     if not books:
         console.print("[yellow]No books with chapter information to convert.[/yellow]")
         sys.exit(0)
+
+    if dry_run:
+        print_dry_run_report(books, output_dir, out_format)
+        return
+
+    assert activation_bytes is not None
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
