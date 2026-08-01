@@ -1,0 +1,21 @@
+# Ignore audiofiles
+*.mp3
+*.aax
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.wav
+
+# Allow gitkeep for default folders
+!.gitkeep
+
+# Never commit converted files
+converted\*
+
+# Python
+__pycache__/
+*.pyc
+
+# Never commit local ffmpeg binaries
+resources/*

@@ -1,130 +1,281 @@
 #!/usr/bin/env python3
 # coding: utf-8
-import ffmpeg
+from __future__ import annotations
+
 import os
 import re
+import shutil
 import subprocess as sp
-from subprocess import *
-from optparse import OptionParser
-from os import mkdir
-from os.path import exists
-from time import sleep
-from os import environ
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-from multiprocess import Pool, Lock, Manager
+import click
+from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
 
-orgDir      = "/home/localadmin/Audiobooks"
-saveDir     = f"{orgDir}/converted"
+# Codec/bitrate args per output format. Formats not listed fall back to
+# letting ffmpeg pick a default codec for "-f <format>".
+FORMAT_CODEC_ARGS = {
+    "mp3": ["-codec:a", "libmp3lame", "-b:a", "192k"],
+    "m4a": ["-codec:a", "aac", "-b:a", "192k"],
+    "aac": ["-codec:a", "aac", "-b:a", "192k"],
+    "flac": ["-codec:a", "flac"],
+    "wav": ["-codec:a", "pcm_s16le"],
+    "ogg": ["-codec:a", "libvorbis", "-b:a", "192k"],
+}
 
-def parseChapters(filename):
-    chapters = []
-    command = [ "ffmpeg", '-i', filename]
-    output = ""
+CHAPTER_RE = re.compile(r".*Chapter #(\d+):(\d+): start (\d+\.\d+), end (\d+\.\d+).*")
+
+console = Console()
+
+
+def find_ffmpeg(explicit_path: str | None) -> str:
+    """Resolve the ffmpeg executable: explicit override > PATH."""
+    if explicit_path:
+        path = Path(explicit_path)
+        if not path.exists():
+            raise FileNotFoundError(f"ffmpeg not found at explicit path: {explicit_path}")
+        return str(path)
+
+    on_path = shutil.which("ffmpeg")
+    if on_path:
+        return on_path
+
+    raise FileNotFoundError(
+        "ffmpeg was not found on PATH. Install ffmpeg (e.g. 'winget install ffmpeg', "
+        "'brew install ffmpeg', or 'apt install ffmpeg') or pass --ffmpeg with an explicit path."
+    )
+
+
+def parse_chapters(ffmpeg_path: str, filename: Path) -> list[dict]:
+    command = [ffmpeg_path, "-i", str(filename)]
     try:
         output = sp.check_output(command, stderr=sp.STDOUT, universal_newlines=True)
-    except CalledProcessError as e:
-        output = e.output 
-   
-    lines   = output.splitlines()
-    for line in lines:
-        m       = re.match(r".*Chapter #(\d+:\d+): start (\d+\.\d+), end (\d+\.\d+).*", line)
-        if m != None:
-            cd,chp = m.group(1).split(":")
-            chapter = { "cd": int(cd)+1, "chp":int(chp)+1, "start": m.group(2), "end": m.group(3)}
-            chapters.append(chapter)
-            
+    except sp.CalledProcessError as e:
+        output = e.output
+
+    chapters = []
+    for line in output.splitlines():
+        m = CHAPTER_RE.match(line)
+        if m:
+            cd, chp, start, end = m.groups()
+            chapters.append({"cd": int(cd) + 1, "chp": int(chp) + 1, "start": start, "end": end})
     return chapters
 
-def getChapters( filename:str=None ):
-    fdir    = os.path.dirname(filename)
-    fname   = os.path.basename(filename)
-    fbase, fext = os.path.splitext( fname )
-    fext = fext[1:]
 
-    chapters = parseChapters( filename )
+def get_chapters(ffmpeg_path: str, filename: Path) -> list[dict]:
+    bname = filename.stem
+    chapters = parse_chapters(ffmpeg_path, filename)
     for chap in chapters:
-        chap['bname']       = fbase
-        chap["orgFile"]     = filename
+        chap["bname"] = bname
+        chap["orgFile"] = str(filename)
     return chapters
 
-def split_book(chapters,outBaseDir,stdoutlock):
-    for c in chapters:
-        outDir = f"{outBaseDir}/{c['bname']}"
-        stdoutlock.acquire()
-        if not exists(outDir):
-            mkdir( outDir )
-            print(f"Created {outDir}" )
-        stdoutlock.release()
-        
-        cdnum = c['cd'] if c['cd']>=10 else f"0{c['cd']}"
-        chnum = str(c['chp'])
-        if c['chp'] < 10:
-            chnum = f"00{c['chp']}"
-        elif c['chp'] < 100:
-            chnum = f"0{c['chp']}"
+
+def chapter_filename(chapter: dict, chapter_width: int, cd_width: int, out_format: str) -> str:
+    return f"{chapter['cd']:0{cd_width}d}-{chapter['chp']:0{chapter_width}d}-{chapter['bname']}.{out_format}"
 
 
-        outputfilename = f"{outDir}/{cdnum}-{chnum}-{c['bname']}.mp3"
-        if exists( outputfilename ):
-            stdoutlock.acquire()
-            print( f"\tFile alreadyexists: {cdnum}-{chnum}-{c['bname']}.mp3" )
-            stdoutlock.release()
-            continue
-        stdoutlock.acquire()
-        print( f"\tCreating chapter: {cdnum}-{chnum}-{c['bname']}.mp3" )
-        stdoutlock.release()
-            
-        command = ["ffmpeg", 
-                    "-activation_bytes", environ["audible.activation_bytes"],
-                    "-vn", 
-                    "-vsync", "2",
-                    "-i", c["orgFile"],
-                    "-ss", f'{c["start"]}',
-                    "-to", f'{c["end"]}',
-                    "-ar", "44100", 
-                    "-b:a", "192k", 
-                    "-ac", "2", 
-                    "-f", "mp3",
-                    outputfilename ]
-        output = ""
-        try:
-            output = sp.check_output(command, stderr=sp.STDOUT, universal_newlines=True)
-        except CalledProcessError as e:
-            output = e.output 
-        stdoutlock.acquire()
-        print( f"\tCreated: {cdnum}-{chnum}-{c['bname']}.mp3" )
-        stdoutlock.release()
+def convert_chapter(
+    ffmpeg_path: str,
+    chapter: dict,
+    out_dir: Path,
+    activation_bytes: str,
+    out_format: str,
+    chapter_width: int,
+    cd_width: int,
+) -> tuple[str, bool, str | None]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = chapter_filename(chapter, chapter_width, cd_width, out_format)
+    out_path = out_dir / out_name
+
+    if out_path.exists():
+        return out_name, True, "skipped (already exists)"
+
+    codec_args = FORMAT_CODEC_ARGS.get(out_format, ["-f", out_format])
+    command = [
+        ffmpeg_path,
+        "-activation_bytes", activation_bytes,
+        "-vn", "-vsync", "2",
+        "-i", chapter["orgFile"],
+        "-ss", chapter["start"],
+        "-to", chapter["end"],
+        "-ar", "44100", "-ac", "2",
+        *codec_args,
+        str(out_path),
+    ]
+    try:
+        sp.check_output(command, stderr=sp.STDOUT, universal_newlines=True)
+        return out_name, True, None
+    except sp.CalledProcessError as e:
+        out_path.unlink(missing_ok=True)
+        return out_name, False, e.output
 
 
-audiobooks = {}   
-with open("filelist.txt", encoding="utf-8") as filenamelist:
-    for filename in filenamelist.readlines():
-        filename = filename.strip()
-        orgFileName = f"{orgDir}/{filename}"
-        print( f"Parsing: {orgFileName}" )
-        chapters = getChapters( orgFileName )
-        audiobooks.update({filename: chapters})
-        for c in chapters:
-            cdnum = str(c['cd']) if c['cd']>=10 else f"0{c['cd']}"
-            chnum = str(c['chp'])
-            if c['chp'] < 10:
-                chnum = f"00{c['chp']}"
-            elif c['chp'] < 100:
-                chnum = f"0{c['chp']}"
+def process_book(
+    ffmpeg_path: str,
+    book_name: str,
+    chapters: list[dict],
+    output_dir: Path,
+    activation_bytes: str,
+    out_format: str,
+    chapter_workers: int,
+    progress: Progress,
+    books_task: TaskID,
+) -> tuple[str, list[tuple[str, str]]]:
+    chapter_width = max(3, len(str(len(chapters))))
+    cd_width = max(2, len(str(max(c["cd"] for c in chapters))))
+    out_dir = output_dir / chapters[0]["bname"]
+
+    book_task = progress.add_task(f"[cyan]{book_name}", total=len(chapters))
+
+    failures = []
+    with ThreadPoolExecutor(max_workers=chapter_workers) as pool:
+        futures = {
+            pool.submit(
+                convert_chapter, ffmpeg_path, c, out_dir, activation_bytes, out_format, chapter_width, cd_width
+            ): c
+            for c in chapters
+        }
+        for future in as_completed(futures):
+            out_name, ok, message = future.result()
+            if not ok:
+                failures.append((out_name, message or ""))
+                last_line = (message or "").strip().splitlines()[-1] if message else ""
+                console.print(f"[red]FAILED[/red] {book_name}/{out_name}: {last_line}")
+            progress.advance(book_task)
+
+    progress.remove_task(book_task)
+    progress.advance(books_task)
+    status = "[green]done[/green]" if not failures else f"[yellow]done with {len(failures)} failure(s)[/yellow]"
+    console.print(f"{status}: {book_name} ({len(chapters)} chapters)")
+    return book_name, failures
 
 
-print()
-with Manager() as manager:
-    stdoutlock = manager.Lock()
-    processes = []
-    arg_map = []
-    for fname,chapters in audiobooks.items():
-        arg_map.append([chapters, saveDir, stdoutlock])
+def discover_books(input_dir: Path) -> list[Path]:
+    return sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() == ".aax")
 
-    with Pool() as p:
-        print("Generating pool")
-        result = p.starmap_async(split_book, arg_map)
-        
-        while not result.ready():
-            print("Not finished")
-            sleep(10)
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "-i", "--input-dir", "input_dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default=Path.cwd(), show_default="current directory",
+    help="Directory containing .aax audiobook files.",
+)
+@click.option(
+    "-o", "--output-dir", "output_dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=Path("converted"), show_default=True,
+    help="Directory to write converted books into.",
+)
+@click.option(
+    "-a", "--activation-bytes", "activation_bytes",
+    default=lambda: os.environ.get("AUDIBLE_ACTIVATION_BYTES"),
+    help="Audible activation bytes (or set the AUDIBLE_ACTIVATION_BYTES environment variable).",
+)
+@click.option(
+    "-f", "--format", "out_format",
+    default="mp3", show_default=True,
+    help="Output audio format/extension, e.g. mp3, m4a, flac, wav, ogg.",
+)
+@click.option(
+    "--book-workers", "book_workers", type=int, default=2, show_default=True,
+    help="Number of audiobooks to convert simultaneously.",
+)
+@click.option(
+    "--chapter-workers", "chapter_workers", type=int, default=4, show_default=True,
+    help="Number of chapters to convert simultaneously per book.",
+)
+@click.option(
+    "--ffmpeg", "ffmpeg_override", default=None,
+    help="Explicit path to an ffmpeg executable (overrides PATH lookup).",
+)
+def main(
+    input_dir: Path,
+    output_dir: Path,
+    activation_bytes: str | None,
+    out_format: str,
+    book_workers: int,
+    chapter_workers: int,
+    ffmpeg_override: str | None,
+) -> None:
+    """Convert Audible AAX audiobooks into per-chapter audio files."""
+    try:
+        ffmpeg_path = find_ffmpeg(ffmpeg_override)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    if not activation_bytes:
+        console.print(
+            "[red]No Audible activation bytes provided. "
+            "Pass --activation-bytes or set the AUDIBLE_ACTIVATION_BYTES environment variable.[/red]"
+        )
+        sys.exit(1)
+
+    out_format = out_format.lower().lstrip(".")
+
+    book_files = discover_books(input_dir)
+    if not book_files:
+        console.print(f"[yellow]No .aax files found in {input_dir}[/yellow]")
+        sys.exit(0)
+
+    console.print(f"Using ffmpeg: [bold]{ffmpeg_path}[/bold]")
+    console.print(f"Found {len(book_files)} audiobook(s) in {input_dir}")
+    console.print("Reading chapter information...")
+
+    books: dict[str, list[dict]] = {}
+    with ThreadPoolExecutor(max_workers=book_workers) as pool:
+        futures = {pool.submit(get_chapters, ffmpeg_path, f): f for f in book_files}
+        for future in as_completed(futures):
+            f = futures[future]
+            chapters = future.result()
+            if not chapters:
+                console.print(f"[yellow]No chapters found, skipping: {f.name}[/yellow]")
+                continue
+            books[f.name] = chapters
+
+    if not books:
+        console.print("[yellow]No books with chapter information to convert.[/yellow]")
+        sys.exit(0)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    )
+
+    all_failures: dict[str, list[tuple[str, str]]] = {}
+    with progress:
+        books_task = progress.add_task("[bold]Books[/bold]", total=len(books))
+        with ThreadPoolExecutor(max_workers=book_workers) as pool:
+            futures = [
+                pool.submit(
+                    process_book, ffmpeg_path, name, chapters, output_dir,
+                    activation_bytes, out_format, chapter_workers, progress, books_task,
+                )
+                for name, chapters in books.items()
+            ]
+            for future in as_completed(futures):
+                name, failures = future.result()
+                if failures:
+                    all_failures[name] = failures
+
+    console.print()
+    if all_failures:
+        console.print(f"[yellow]Finished with failures in {len(all_failures)} book(s):[/yellow]")
+        for name, failures in all_failures.items():
+            console.print(f"  {name}: {len(failures)} chapter(s) failed")
+        sys.exit(1)
+    else:
+        console.print("[green]All books converted successfully.[/green]")
+
+
+if __name__ == "__main__":
+    main()
