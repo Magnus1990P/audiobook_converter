@@ -1,8 +1,9 @@
 # audiobook_converter
 
 Converts Audible `.aax` audiobooks into per-chapter audio files (MP3 by
-default), with a live console progress display. Runs on Windows, Linux, and
-macOS.
+default), with a live console progress display. Can also produce a single
+`.m4b` file per book with its original chapter markers intact. Runs on
+Windows, Linux, and macOS.
 
 ## Requirements
 
@@ -61,10 +62,11 @@ wherever `--output-dir` points.
 | `-i, --input-dir` | current directory | Directory containing `.aax` files |
 | `-o, --output-dir` | `.\converted` | Where converted books are written |
 | `-a, --activation-bytes` | `$AUDIBLE_ACTIVATION_BYTES` | Your Audible activation bytes |
-| `-f, --format` | `mp3` | Output format/extension: `mp3`, `m4a`, `aac`, `flac`, `wav`, `ogg`, ... |
+| `-f, --format` | `mp3` | Output format/extension: `mp3`, `m4a`, `aac`, `flac`, `wav`, `ogg`, `m4b`, ... |
 | `--book-workers` | `2` | Audiobooks converted simultaneously |
-| `--chapter-workers` | `4` | Chapters converted simultaneously per book |
+| `--chapter-workers` | `4` | Chapters converted simultaneously per book (ignored for `m4b`) |
 | `--ffmpeg` | — | Explicit path to an ffmpeg executable, bypassing `PATH` lookup |
+| `--dry-run` | off | List what would be converted, and which output files already exist, without converting anything |
 
 Run `python main.py --help` for the full list.
 
@@ -85,6 +87,26 @@ converted/
 
 Chapters that already exist in the output directory are skipped, so a
 canceled/interrupted run can simply be re-run to pick up where it left off.
+
+Chapters ffmpeg reports with an invalid duration (a negative start, or an end
+time not after the start) are skipped with a warning instead of being
+converted.
+
+#### `--format m4b`: single file with chapters
+
+`m4b` is a special case: instead of splitting the book into one file per
+chapter, it produces a single `<book name>.m4b` directly in the output
+directory, with the book's original chapter markers preserved (M4B supports
+chapters natively, unlike MP3). The audio is stream-copied rather than
+re-encoded, so it's fast and lossless:
+
+```
+converted/
+  My Great Book.m4b
+```
+
+Because there's only one file to produce per book, `--chapter-workers` has no
+effect in this mode.
 
 ### Concurrency
 
