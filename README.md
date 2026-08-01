@@ -5,6 +5,11 @@ default), with a live console progress display. Can also produce a single
 `.m4b` file per book with its original chapter markers intact. Runs on
 Windows, Linux, and macOS.
 
+A small, self-contained alternative to existing AAX-to-MP3/M4B converters
+such as OpenAudible, Libation, and AAXtoMP3 — a single Python script with no
+bundled binaries, built around parallel, resumable conversion of many books
+at once.
+
 ## Requirements
 
 - Python 3.10+
