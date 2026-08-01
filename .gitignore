@@ -1,17 +1,8 @@
-# Ignore audiofiles
-*.mp3
-*.aax
-*.flac
-*.ogg
-*.m4a
-*.aac
-*.wav
-
 # Allow gitkeep for default folders
 !.gitkeep
 
 # Never commit converted files
-converted\*
+converted/*
 
 # Python
 __pycache__/

@@ -48,7 +48,7 @@ def find_ffmpeg(explicit_path: str | None) -> str:
     )
 
 
-def parse_chapters(ffmpeg_path: str, filename: Path) -> list[dict]:
+def parse_chapters(ffmpeg_path: str, filename: Path) -> tuple[list[dict], int]:
     command = [ffmpeg_path, "-i", str(filename)]
     try:
         output = sp.check_output(command, stderr=sp.STDOUT, universal_newlines=True)
@@ -56,25 +56,43 @@ def parse_chapters(ffmpeg_path: str, filename: Path) -> list[dict]:
         output = e.output
 
     chapters = []
+    invalid = 0
     for line in output.splitlines():
         m = CHAPTER_RE.match(line)
         if m:
-            cd, chp, start, end = m.groups()
-            chapters.append({"cd": int(cd) + 1, "chp": int(chp) + 1, "start": start, "end": end})
-    return chapters
+            cd, chapter_index, start_ts, end_ts = m.groups()
+            start_ts_val, end_ts_val = float(start_ts), float(end_ts)
+            if start_ts_val < 0 or end_ts_val <= start_ts_val:
+                invalid += 1
+                console.print(
+                    f"[yellow]Skipping invalid chapter cd={int(cd) + 1} chapter_index={int(chapter_index) + 1} "
+                    f"in {filename.name}: start={start_ts}, end={end_ts}[/yellow]"
+                )
+                continue
+            chapters.append(
+                {
+                    "cd": int(cd) + 1,
+                    "chapter_index": int(chapter_index) + 1,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                }
+            )
+    return chapters, invalid
 
 
-def get_chapters(ffmpeg_path: str, filename: Path) -> list[dict]:
-    bname = filename.stem
-    chapters = parse_chapters(ffmpeg_path, filename)
+def get_chapters(ffmpeg_path: str, filename: Path) -> tuple[list[dict], int]:
+    book_name = filename.stem
+    chapters, invalid = parse_chapters(ffmpeg_path, filename)
     for chap in chapters:
-        chap["bname"] = bname
+        chap["book_name"] = book_name
         chap["orgFile"] = str(filename)
-    return chapters
+    return chapters, invalid
 
 
-def chapter_filename(chapter: dict, chapter_width: int, cd_width: int, out_format: str) -> str:
-    return f"{chapter['cd']:0{cd_width}d}-{chapter['chp']:0{chapter_width}d}-{chapter['bname']}.{out_format}"
+def chapter_filename(
+    cd: int, chapter_index: int, book_name: str, chapter_width: int, cd_width: int, out_format: str
+) -> str:
+    return f"{cd:0{cd_width}d}-{chapter_index:0{chapter_width}d}-{book_name}.{out_format}"
 
 
 def compute_padding(chapters: list[dict]) -> tuple[int, int]:
@@ -85,7 +103,12 @@ def compute_padding(chapters: list[dict]) -> tuple[int, int]:
 
 def convert_chapter(
     ffmpeg_path: str,
-    chapter: dict,
+    org_file: str,
+    cd: int,
+    chapter_index: int,
+    book_name: str,
+    start_ts: str,
+    end_ts: str,
     out_dir: Path,
     activation_bytes: str,
     out_format: str,
@@ -93,7 +116,7 @@ def convert_chapter(
     cd_width: int,
 ) -> tuple[str, bool, str | None]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = chapter_filename(chapter, chapter_width, cd_width, out_format)
+    out_name = chapter_filename(cd, chapter_index, book_name, chapter_width, cd_width, out_format)
     out_path = out_dir / out_name
 
     if out_path.exists():
@@ -104,11 +127,38 @@ def convert_chapter(
         ffmpeg_path,
         "-activation_bytes", activation_bytes,
         "-vn", "-vsync", "2",
-        "-i", chapter["orgFile"],
-        "-ss", chapter["start"],
-        "-to", chapter["end"],
+        "-i", org_file,
+        "-ss", start_ts,
+        "-to", end_ts,
         "-ar", "44100", "-ac", "2",
         *codec_args,
+        str(out_path),
+    ]
+    try:
+        sp.check_output(command, stderr=sp.STDOUT, universal_newlines=True)
+        return out_name, True, None
+    except sp.CalledProcessError as e:
+        out_path.unlink(missing_ok=True)
+        return out_name, False, e.output
+
+
+def convert_book(
+    ffmpeg_path: str, org_file: str, book_name: str, output_dir: Path, activation_bytes: str, out_format: str
+) -> tuple[str, bool, str | None]:
+    """Remux a whole book into a single file, stream-copying audio so embedded chapters survive intact."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_name = f"{book_name}.{out_format}"
+    out_path = output_dir / out_name
+
+    if out_path.exists():
+        return out_name, True, "skipped (already exists)"
+
+    command = [
+        ffmpeg_path,
+        "-activation_bytes", activation_bytes,
+        "-vn",
+        "-i", org_file,
+        "-c:a", "copy",
         str(out_path),
     ]
     try:
@@ -130,31 +180,42 @@ def process_book(
     progress: Progress,
     books_task: TaskID,
 ) -> tuple[str, list[tuple[str, str]]]:
-    chapter_width, cd_width = compute_padding(chapters)
-    out_dir = output_dir / chapters[0]["bname"]
-
-    book_task = progress.add_task(f"[cyan]{book_name}", total=len(chapters))
+    if out_format == "m4b":
+        # A single stream-copied file per book, keeping its original embedded
+        # chapters, instead of splitting into one file per chapter.
+        book_task = progress.add_task(f"[cyan]{book_name}", total=1)
+        results = [convert_book(ffmpeg_path, chapters[0]["orgFile"], book_name, output_dir, activation_bytes, out_format)]
+        progress.advance(book_task)
+    else:
+        chapter_width, cd_width = compute_padding(chapters)
+        out_dir = output_dir / book_name
+        book_task = progress.add_task(f"[cyan]{book_name}", total=len(chapters))
+        results = []
+        with ThreadPoolExecutor(max_workers=chapter_workers) as pool:
+            futures = [
+                pool.submit(
+                    convert_chapter, ffmpeg_path, c["orgFile"], c["cd"], c["chapter_index"], book_name,
+                    c["start_ts"], c["end_ts"], out_dir, activation_bytes, out_format, chapter_width, cd_width,
+                )
+                for c in chapters
+            ]
+            for future in as_completed(futures):
+                results.append(future.result())
+                progress.advance(book_task)
 
     failures = []
-    with ThreadPoolExecutor(max_workers=chapter_workers) as pool:
-        futures = {
-            pool.submit(
-                convert_chapter, ffmpeg_path, c, out_dir, activation_bytes, out_format, chapter_width, cd_width
-            ): c
-            for c in chapters
-        }
-        for future in as_completed(futures):
-            out_name, ok, message = future.result()
-            if not ok:
-                failures.append((out_name, message or ""))
-                last_line = (message or "").strip().splitlines()[-1] if message else ""
-                console.print(f"[red]FAILED[/red] {book_name}/{out_name}: {last_line}")
-            progress.advance(book_task)
+    for out_name, ok, message in results:
+        if not ok:
+            failures.append((out_name, message or ""))
+            last_line = (message or "").strip().splitlines()[-1] if message else ""
+            console.print(f"[red]FAILED[/red] {book_name}/{out_name}: {last_line}")
 
     progress.remove_task(book_task)
     progress.advance(books_task)
     status = "[green]done[/green]" if not failures else f"[yellow]done with {len(failures)} failure(s)[/yellow]"
-    console.print(f"{status}: {book_name} ({len(chapters)} chapters)")
+    unit = "file" if out_format == "m4b" else "chapters"
+    count = len(results) if out_format == "m4b" else len(chapters)
+    console.print(f"{status}: {book_name} ({count} {unit})")
     return book_name, failures
 
 
@@ -162,19 +223,40 @@ def discover_books(input_dir: Path) -> list[Path]:
     return sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() == ".aax")
 
 
-def print_dry_run_report(books: dict[str, list[dict]], output_dir: Path, out_format: str) -> None:
+def print_dry_run_report(
+    books: dict[str, list[dict]], invalid_counts: dict[str, int], output_dir: Path, out_format: str
+) -> None:
     console.print("[bold]Dry run[/bold] — no files will be converted.\n")
+
+    if out_format == "m4b":
+        existing = 0
+        for book_name in books:
+            out_path = output_dir / f"{book_name}.m4b"
+            already_exists = out_path.exists()
+            marker = "[yellow](exists)[/yellow]" if already_exists else "[green](will create)[/green]"
+            console.print(f"[cyan]{book_name}.m4b[/cyan] -> {out_path}  {marker}")
+            if already_exists:
+                existing += 1
+        console.print(
+            f"\n[bold]Summary:[/bold] {len(books)} book(s) — "
+            f"{existing} already exist, {len(books) - existing} would be created."
+        )
+        return
 
     total_chapters = 0
     total_existing = 0
+    total_invalid = 0
     for book_name, chapters in books.items():
         chapter_width, cd_width = compute_padding(chapters)
-        out_dir = output_dir / chapters[0]["bname"]
+        out_dir = output_dir / book_name
+        invalid = invalid_counts.get(book_name, 0)
 
         existing = 0
         console.print(f"[cyan]{book_name}[/cyan] ({len(chapters)} chapters -> {out_dir})")
         for chapter in chapters:
-            out_name = chapter_filename(chapter, chapter_width, cd_width, out_format)
+            out_name = chapter_filename(
+                chapter["cd"], chapter["chapter_index"], book_name, chapter_width, cd_width, out_format
+            )
             already_exists = (out_dir / out_name).exists()
             if already_exists:
                 existing += 1
@@ -182,14 +264,22 @@ def print_dry_run_report(books: dict[str, list[dict]], output_dir: Path, out_for
             else:
                 console.print(f"  {out_name}  [green](will create)[/green]")
 
-        console.print(f"  -> {existing} already exist, {len(chapters) - existing} to create\n")
+        summary = f"  -> {existing} already exist, {len(chapters) - existing} to create"
+        if invalid:
+            summary += f", [red]{invalid} invalid chapter(s) skipped[/red]"
+        console.print(summary + "\n")
+
         total_chapters += len(chapters)
         total_existing += existing
+        total_invalid += invalid
 
-    console.print(
+    summary = (
         f"[bold]Summary:[/bold] {len(books)} book(s), {total_chapters} chapter(s) total — "
-        f"{total_existing} already exist, {total_chapters - total_existing} would be created."
+        f"{total_existing} already exist, {total_chapters - total_existing} would be created"
     )
+    if total_invalid:
+        summary += f", {total_invalid} invalid chapter(s) skipped"
+    console.print(summary + ".")
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -267,22 +357,26 @@ def main(
     console.print("Reading chapter information...")
 
     books: dict[str, list[dict]] = {}
+    invalid_counts: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=book_workers) as pool:
         futures = {pool.submit(get_chapters, ffmpeg_path, f): f for f in book_files}
         for future in as_completed(futures):
             f = futures[future]
-            chapters = future.result()
+            chapters, invalid = future.result()
+            book_name = f.stem
+            if invalid:
+                invalid_counts[book_name] = invalid
             if not chapters:
                 console.print(f"[yellow]No chapters found, skipping: {f.name}[/yellow]")
                 continue
-            books[f.name] = chapters
+            books[book_name] = chapters
 
     if not books:
         console.print("[yellow]No books with chapter information to convert.[/yellow]")
         sys.exit(0)
 
     if dry_run:
-        print_dry_run_report(books, output_dir, out_format)
+        print_dry_run_report(books, invalid_counts, output_dir, out_format)
         return
 
     assert activation_bytes is not None
